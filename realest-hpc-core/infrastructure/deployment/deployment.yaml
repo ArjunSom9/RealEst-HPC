@@ -1,0 +1,89 @@
+---
+# ==============================================================================
+# HEADLESS SERVICE
+# Required for gRPC and Shard Routing. 
+# Setting clusterIP: None means K8s won't put a single load balancer IP in front.
+# Instead, a DNS lookup for 'realest-worker-service' returns the direct IPs of 
+# all active worker pods, allowing your ShardManager to route to specific nodes.
+# ==============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: realest-worker-service
+  namespace: default
+  labels:
+    app: realest-worker
+spec:
+  clusterIP: None
+  ports:
+    - port: 50051
+      targetPort: 50051
+      protocol: TCP
+      name: grpc
+      # Hint to modern ingress controllers/meshes (like Istio/Envoy) that this is gRPC
+      appProtocol: grpc 
+  selector:
+    app: realest-worker
+
+---
+# ==============================================================================
+# WORKER NODE DEPLOYMENT
+# Manages the replicated pods of your C++ Inference Engine.
+# ==============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: realest-worker-deployment
+  namespace: default
+  labels:
+    app: realest-worker
+spec:
+  # Start with 3 nodes to match your ShardManager simulation in main.cc
+  replicas: 3
+  selector:
+    matchLabels:
+      app: realest-worker
+  template:
+    metadata:
+      labels:
+        app: realest-worker
+    spec:
+      containers:
+        - name: realest-worker-container
+          # Replace with your actual registry (e.g., ghcr.io/yourname/realest-worker:latest)
+          image: realest-worker:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 50051
+              name: grpc
+          
+          # --------------------------------------------------------------------
+          # HPC RESOURCE ALLOCATION
+          # --------------------------------------------------------------------
+          resources:
+            requests:
+              cpu: "4"             # Need plenty of CPU for the lock-free thread pool
+              memory: "8Gi"        # Subsets of the vector data are held in RAM
+            limits:
+              cpu: "8"
+              memory: "16Gi"
+              # CRITICAL: This exposes the physical GPU to your container.
+              # Requires the NVIDIA Device Plugin installed on your K8s cluster.
+              nvidia.com/gpu: 1
+
+          # --------------------------------------------------------------------
+          # HEALTH CHECKS
+          # Ensures the ShardManager doesn't route traffic to dead nodes
+          # --------------------------------------------------------------------
+          # Note: gRPC requires a specialized probe or a standard TCP probe.
+          # Here we use a standard TCP socket check on the gRPC port.
+          readinessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 15
+            periodSeconds: 20
