@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package realest.hpc;
+
+// The core gRPC service replacing Firebase.
+// Handles both the ingestion of new properties and high-throughput vector searches.
+service RealEstService {
+  // Accepts property data, hashes the lat/lng to a Geohash, 
+  // and routes it to the appropriate worker node.
+  rpc IngestProperty (IngestRequest) returns (IngestResponse) {}
+
+  // Executes the fused geospatial and vector similarity search.
+  rpc SearchProperties (SearchRequest) returns (SearchResponse) {}
+}
+
+// Represents a geographical coordinate
+message GeoLocation {
+  double latitude = 1;
+  double longitude = 2;
+}
+
+// The core data structure for a real estate listing in the HPC engine.
+message Property {
+  // Unique identifier for the property
+  string id = 1;
+  
+  // Physical location used for Geohashing and Phase 2 distance calculations
+  GeoLocation location = 2;
+  
+  // The high-dimensional vector representing the property's semantic features
+  // (e.g., visual style, descriptions). Packed for memory efficiency.
+  repeated float embedding = 3 [packed = true];
+  
+  // Basic scalar metadata (optional, but realistic for real estate)
+  float price = 4;
+  int32 bedrooms = 5;
+  int32 bathrooms = 6;
+}
+
+// Request payload for adding a new property to the distributed engine
+message IngestRequest {
+  Property property = 1;
+}
+
+// Response payload for the ingestion service
+message IngestResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// The high-throughput search payload that will trigger the custom GPU kernels
+message SearchRequest {
+  // The vector representing what the user is looking for ("semantic similarity")
+  repeated float query_embedding = 1 [packed = true];
+  
+  // The center point of the user's search ("geospatial relevance")
+  GeoLocation query_location = 2;
+  
+  // Maximum number of results to return (e.g., top 10)
+  int32 top_k = 3;
+  
+  // Optional: Maximum physical distance in meters to consider
+  float max_radius_meters = 4;
+}
+
+// Represents a single scored result from the Phase 2 fused kernel
+message SearchResult {
+  // The ID of the matched property
+  string property_id = 1;
+  
+  // The final fused score calculated by your custom CUDA/Triton kernel
+  // (combines Cosine Similarity AND physical distance)
+  float fused_score = 2;
+  
+  // Optional: Return the actual property data
+  Property property = 3;
+}
+
+// The final response sent back to the client
+message SearchResponse {
+  repeated SearchResult results = 1;
+  
+  // Metric tracking for your Phase 4 outcomes (e.g., sub-millisecond latency)
+  float compute_time_ms = 2;
+}
