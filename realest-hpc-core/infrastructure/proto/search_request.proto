@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package realest.hpc;
+
+// Import the base property definitions
+import "property.proto";
+
+// The high-throughput search payload that will trigger the custom GPU kernels
+message SearchRequest {
+  // The vector representing what the user is looking for ("semantic similarity")
+  // Packed for memory efficiency during serialization/deserialization.
+  repeated float query_embedding = 1 [packed = true];
+  
+  // The center point of the user's search ("geospatial relevance")
+  GeoLocation query_location = 2;
+  
+  // Maximum number of results to return (e.g., top 10)
+  int32 top_k = 3;
+  
+  // Maximum physical distance in meters to consider for the fused kernel
+  float max_radius_meters = 4;
+}
+
+// Represents a single scored result from the Phase 2 fused kernel
+message SearchResult {
+  // The ID of the matched property
+  string property_id = 1;
+  
+  // The final fused score calculated by your custom CUDA/Triton kernel
+  // (Combines Cosine Similarity AND physical distance)
+  float fused_score = 2;
+  
+  // The actual property data returned to the client
+  Property property = 3;
+}
+
+// The final response sent back to the client after the shard manager aggregates results
+message SearchResponse {
+  // A list of the top matching properties, sorted by fused_score
+  repeated SearchResult results = 1;
+  
+  // Metric tracking for your Phase 4 outcomes (e.g., sub-millisecond latency)
+  // Essential for validating your C++ thread pool and GPU kernel performance.
+  float compute_time_ms = 2;
+}
