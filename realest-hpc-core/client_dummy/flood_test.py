@@ -18,8 +18,9 @@ except ImportError:
 # --- Configuration for the Flood Test ---
 SERVER_ADDRESS = 'localhost:50051'
 VECTOR_DIMENSION = 128  # Size of the embeddings
-TOTAL_REQUESTS = 10000  # Start with 10k for local testing, scale to 50k+ for true HPC testing
-CONCURRENCY_LIMIT = 500 # Number of concurrent in-flight requests
+TOTAL_REQUESTS = 50000  # Scaled to 50k for true HPC testing
+CONCURRENCY_LIMIT = 2000 # Number of concurrent in-flight requests
+CHANNEL_POOL_SIZE = 48  # Prevent HTTP/2 stream exhaustion
 
 def generate_random_embedding(dim: int) -> list[float]:
     """Generates a random normalized float array simulating a vector embedding."""
@@ -74,18 +75,22 @@ async def fire_search_request(stub: property_pb2_grpc.RealEstServiceStub, semaph
 async def run_flood_test():
     print(f"=== RealEst-HPC Distributed Engine Flood Tester ===")
     print(f"Target: {SERVER_ADDRESS}")
-    print(f"Requests: {TOTAL_REQUESTS} | Concurrency: {CONCURRENCY_LIMIT}")
+    print(f"Requests: {TOTAL_REQUESTS} | Concurrency: {CONCURRENCY_LIMIT} | Channels: {CHANNEL_POOL_SIZE}")
     print("---------------------------------------------------")
     
-    # Establish async gRPC channel
-    async with grpc.aio.insecure_channel(SERVER_ADDRESS) as channel:
-        stub = property_pb2_grpc.RealEstServiceStub(channel)
-        
-        # 1. Warmup: Ingest a few properties
+    channels = []
+    stubs = []
+    for _ in range(CHANNEL_POOL_SIZE):
+        channel = grpc.aio.insecure_channel(SERVER_ADDRESS)
+        channels.append(channel)
+        stubs.append(property_pb2_grpc.RealEstServiceStub(channel))
+
+    try:
+        # 1. Warmup: Ingest a few properties using the first channel
         print("[*] Warming up ingestion service...")
         for i in range(10):
             req = create_random_ingest_request(f"warmup_prop_{i}")
-            await stub.IngestProperty(req)
+            await stubs[0].IngestProperty(req)
         print("[*] Warmup complete. Beginning search flood test...\n")
 
         # 2. Setup concurrency control and metric storage
@@ -93,10 +98,10 @@ async def run_flood_test():
         latencies = []
         server_compute_times = []
         
-        # 3. Create all tasks
+        # 3. Create all tasks, round-robining across the channel pool
         tasks = [
-            fire_search_request(stub, semaphore, latencies, server_compute_times)
-            for _ in range(TOTAL_REQUESTS)
+            fire_search_request(stubs[i % CHANNEL_POOL_SIZE], semaphore, latencies, server_compute_times)
+            for i in range(TOTAL_REQUESTS)
         ]
         
         # 4. FIRE! Measure total time taken to resolve all futures
@@ -121,9 +126,14 @@ async def run_flood_test():
         print("====================")
         
         if rps > 40000:
-            print("🚀 Phase 4 Throughput Goal (50k RPS) is within reach!")
+            print("Phase 4 Throughput Goal (50k RPS) is within reach")
         else:
-            print("🔧 Tuning required: Check C++ lock contention or network limits to reach 50k RPS.")
+            print("Tuning required: Check C++ lock contention or network limits to reach 50k RPS.")
+    
+    finally:
+        # Cleanly close all channels in the pool
+        for channel in channels:
+            await channel.close()
 
 if __name__ == "__main__":
     # Required for Python 3.8+ asyncio on some platforms to handle high socket connections cleanly
