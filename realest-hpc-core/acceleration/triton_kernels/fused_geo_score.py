@@ -3,44 +3,6 @@ import triton
 import triton.language as tl
 
 # ============================================================================
-# IMMEDIATE ACTION ITEM (TASK 1): "Hello World" Vector Addition
-# ============================================================================
-
-@triton.jit
-def hello_world_add_kernel(
-    x_ptr, y_ptr, output_ptr, n_elements,
-    BLOCK_SIZE: tl.constexpr
-):
-    """
-    Your 'Hello World' for the new path. 
-    Adds two vectors together directly on the GPU using Triton.
-    """
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    
-    # Load data from VRAM into fast SRAM
-    x = tl.load(x_ptr + offsets, mask=mask)
-    y = tl.load(y_ptr + offsets, mask=mask)
-    
-    # Perform computation
-    output = x + y
-    
-    # Store results back to VRAM
-    tl.store(output_ptr + offsets, output, mask=mask)
-
-def hello_world_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Wrapper to launch the Hello World kernel."""
-    output = torch.empty_like(x)
-    n_elements = output.numel()
-    
-    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
-    hello_world_add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)
-    return output
-
-
-# ============================================================================
 # PHASE 2: FUSED GEOSPATIAL + SEMANTIC SIMILARITY KERNEL
 # ============================================================================
 
@@ -184,77 +146,80 @@ def run_fused_geo_attention(
 # EXECUTION & BENCHMARKING (Proving the 40% memory bandwidth reduction)
 # ============================================================================
 if __name__ == "__main__":
-    print("--- TASK 1: Executing 'Hello World' Triton Kernel ---")
-    x = torch.rand(100000, device='cuda')
-    y = torch.rand(100000, device='cuda')
-    z_triton = hello_world_add(x, y)
-    z_torch = x + y
-    torch.testing.assert_close(z_triton, z_torch)
-    print("✅ Hello World Vector Addition Passed!\n")
-
-    print("--- PHASE 2: Benchmarking Eager PyTorch vs. Fused Triton ---")
+    print("--- Benchmarking Eager PyTorch vs. Fused Triton Attention ---")
     
-    # 1. Setup Mock Data (e.g., 2 Million Properties, 128 Dimension Embeddings)
-    NUM_DOCS = 2_000_000
+    # 1. Setup Mock Data for Attention (Multiple Queries vs Sequence of Documents)
+    NUM_QUERIES = 2048
+    NUM_DOCS = 16384
     DIM = 128
-    print(f"Dataset Size: {NUM_DOCS:,} properties, {DIM} dimensions.")
+    print(f"Dataset: {NUM_QUERIES} Queries, {NUM_DOCS} Properties, {DIM} dimensions.")
     
-    query_vec = torch.randn(DIM, device='cuda', dtype=torch.float32)
-    query_loc = torch.tensor([30.2672, -97.7431], device='cuda', dtype=torch.float32) # Austin, TX
+    # We use float16 to trigger the GPU's native Tensor Cores
+    queries = torch.randn((NUM_QUERIES, DIM), device='cuda', dtype=torch.float16)
+    keys = torch.randn((NUM_DOCS, DIM), device='cuda', dtype=torch.float16)
+    values = torch.randn((NUM_DOCS, DIM), device='cuda', dtype=torch.float16)
     
-    doc_vecs = torch.randn((NUM_DOCS, DIM), device='cuda', dtype=torch.float32)
-    doc_locs = torch.randn((NUM_DOCS, 2), device='cuda', dtype=torch.float32)
-    
-    # Pre-normalize for realistic cosine similarity
-    query_vec = torch.nn.functional.normalize(query_vec, p=2, dim=0)
-    doc_vecs = torch.nn.functional.normalize(doc_vecs, p=2, dim=1)
-    
-    # 2. Eager PyTorch Implementation (What you are replacing)
-    def eager_pytorch(q_vec, q_loc, d_vecs, d_locs, weight=0.1):
-        # Memory Pass 1: Dot Product
-        sim_scores = torch.matmul(d_vecs, q_vec)
-        # Memory Pass 2: Distances
-        dist_sq = torch.sum((d_locs - q_loc)**2, dim=1)
-        # Memory Pass 3: Fusion
-        return sim_scores - (dist_sq * weight)
+    # 2. Eager PyTorch Implementation (The baseline we are replacing)
+    def eager_pytorch_attention(q, k, v):
+        """
+        Standard PyTorch implementation of the distance expansion.
+        This writes massive intermediate N x N matrices to HBM.
+        """
+        # Memory Pass 1 & 2 & 3: QK^T and L2 Norms
+        qk = torch.matmul(q, k.t())
+        q_sq = torch.sum(q**2, dim=1, keepdim=True)
+        k_sq = torch.sum(k**2, dim=1, keepdim=True).t()
+        
+        # Memory Pass 4: Distance expansion
+        dist_sq = (2.0 * qk) - q_sq - k_sq
+        
+        # Memory Pass 5: Softmax along the sequence dimension
+        attn = torch.softmax(dist_sq, dim=-1)
+        
+        # Memory Pass 6: Value accumulation
+        return torch.matmul(attn.to(v.dtype), v)
 
     # 3. Warmup
-    _ = eager_pytorch(query_vec, query_loc, doc_vecs, doc_locs)
-    _ = run_fused_geo_score(query_vec, query_loc, doc_vecs, doc_locs)
+    _ = eager_pytorch_attention(queries, keys, values)
+    _ = run_fused_geo_attention(queries, keys, values)
     
     # 4. Correctness Check
-    torch_out = eager_pytorch(query_vec, query_loc, doc_vecs, doc_locs)
-    triton_out = run_fused_geo_score(query_vec, query_loc, doc_vecs, doc_locs)
-    torch.testing.assert_close(torch_out, triton_out, atol=1e-4, rtol=1e-4)
-    print("✅ Triton Output matches PyTorch Output!")
+    torch_out = eager_pytorch_attention(queries, keys, values)
+    triton_out = run_fused_geo_attention(queries, keys, values)
+    
+    # Note: FP16 matrix multiplication and softmax can have minor numerical drift. 
+    # We use a loose tolerance specifically acceptable for FP16 inference.
+    torch.testing.assert_close(torch_out, triton_out, atol=1e-2, rtol=1e-2)
+    print("Triton Output matches PyTorch Output")
 
     # 5. Performance Benchmark using Triton's testing suite
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=['NUM_DOCS'],
-            x_vals=[2**i for i in range(16, 22)], # Test from 65k to 2M rows
+            x_vals=[2**i for i in range(10, 16)], # Test varying sequence lengths
             line_arg='provider',
             line_vals=['pytorch', 'triton'],
             line_names=['Eager PyTorch', 'Fused Triton Kernel'],
             styles=[('blue', '-'), ('green', '-')],
             ylabel='Time (ms)',
-            plot_name='Fused Geospatial Search Performance',
-            args={'dim': 128}
+            plot_name='Fused Geospatial Attention Performance',
+            args={'num_queries': 2048, 'dim': 128}
         )
     )
-    def benchmark(NUM_DOCS, dim, provider):
-        d_vecs = torch.randn((NUM_DOCS, dim), device='cuda')
-        d_locs = torch.randn((NUM_DOCS, 2), device='cuda')
+    def benchmark(NUM_DOCS, num_queries, dim, provider):
+        q = torch.randn((num_queries, dim), device='cuda', dtype=torch.float16)
+        k = torch.randn((NUM_DOCS, dim), device='cuda', dtype=torch.float16)
+        v = torch.randn((NUM_DOCS, dim), device='cuda', dtype=torch.float16)
         quantiles = [0.5, 0.2, 0.8]
         
         if provider == 'pytorch':
             ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: eager_pytorch(query_vec, query_loc, d_vecs, d_locs), 
+                lambda: eager_pytorch_attention(q, k, v), 
                 quantiles=quantiles
             )
         if provider == 'triton':
             ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: run_fused_geo_score(query_vec, query_loc, d_vecs, d_locs), 
+                lambda: run_fused_geo_attention(q, k, v), 
                 quantiles=quantiles
             )
         return ms, min_ms, max_ms
