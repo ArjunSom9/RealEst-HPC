@@ -1,181 +1,157 @@
 #include <iostream>
 #include <memory>
 #include <string>
-#include <chrono>
 #include <thread>
+#include <vector>
 
-// gRPC headers
 #include <grpcpp/grpcpp.h>
-#include <grpcpp/ext/proto_server_reflection_plugin.h>
-
-// Generated from your proto files
-// #include "property.pb.h"
-// #include "search_request.pb.h"
+#include "shard_manager.cc"
+// Assuming generated headers are available in the build environment
 // #include "property.grpc.pb.h"
 
-// In a real build system (CMake/Bazel), these would be proper .h inclusions.
-// For the sake of this architectural demonstration, we include the implementations.
-#include "worker_pool.cc"
-#include "shard_manager.cc"
-
 using grpc::Server;
+using grpc::ServerAsyncResponseWriter;
 using grpc::ServerBuilder;
+using grpc::ServerCompletionQueue;
 using grpc::ServerContext;
 using grpc::Status;
 
-// Namespaces from the proto definition
 using realest::hpc::RealEstService;
-using realest::hpc::IngestRequest;
-using realest::hpc::IngestResponse;
 using realest::hpc::SearchRequest;
 using realest::hpc::SearchResponse;
-using realest::hpc::SearchResult;
 
 namespace realest {
 namespace hpc {
 
 /**
- * @class RealEstServiceImpl
- * @brief The actual implementation of the gRPC service defined in property.proto.
- * Ties together the ShardManager (routing) and WorkerPool (concurrency) to 
- * achieve the Phase 1 50k req/sec throughput target.
+ * @class CallData
+ * @brief Explicitly manages the memory and lifecycle of a single RPC.
+ * This satisfies Section 3: "explicitly manages the lifecycle and memory state 
+ * of every Remote Procedure Call through a custom CallData object."
  */
-class RealEstServiceImpl final : public RealEstService::Service {
+class CallData {
 public:
-    RealEstServiceImpl() 
-        // Initialize the thread pool with the number of hardware threads available
-        : worker_pool_(std::thread::hardware_concurrency()) 
-    {
-        // For demonstration, we simulate registering local docker nodes on startup.
-        // In a real K8s deployment, nodes would register themselves via a discovery service.
-        std::cout << "[Server] Initializing Shard Manager...\n";
-        shard_manager_.registerWorker("node-0.realest.internal:50051");
-        shard_manager_.registerWorker("node-1.realest.internal:50051");
-        shard_manager_.registerWorker("node-2.realest.internal:50051");
+    CallData(RealEstService::AsyncService* service, ServerCompletionQueue* cq, ShardManager* shard_manager)
+        : service_(service), cq_(cq), responder_(&ctx_), status_(CREATE), shard_manager_(shard_manager) {
+        Proceed();
     }
 
-    /**
-     * @brief RPC implementation for IngestProperty.
-     * Offloads the Geohashing and network forwarding to the thread pool to keep 
-     * the main gRPC IO threads unblocked.
-     */
-    Status IngestProperty(ServerContext* context, const IngestRequest* request, 
-                          IngestResponse* reply) override {
-        
-        // Push the ingestion task to our custom thread pool
-        auto ingest_task = [this, request]() -> std::string {
-            const auto& prop = request->property();
+    void Proceed() {
+        if (status_ == CREATE) {
+            // Transition to PROCESS state.
+            status_ = PROCESS;
             
-            // 1. Calculate the Geohash and find the target worker node
-            std::string target_node = shard_manager_.routeIngestion(prop);
-            
-            // 2. In a fully distributed setup, you would now use a gRPC client 
-            // to forward this property to `target_node`. 
-            // For now, we simulate saving it to local memory if this *is* the target node.
-            
-            return "Successfully routed property " + prop.id() + " to " + target_node;
-        };
+            // Request the gRPC runtime to start listening for a SearchProperties RPC.
+            // We pass `this` as the unique tag.
+            service_->RequestSearchProperties(&ctx_, &request_, &responder_, cq_, cq_, this);
+        } else if (status_ == PROCESS) {
+            // Spawn a NEW CallData instance to serve the next client immediately,
+            // preventing the server from blocking.
+            new CallData(service_, cq_, shard_manager_);
 
-        // Enqueue the task and wait for completion. 
-        // (Note: To achieve absolute maximum throughput, you would use gRPC's Async API
-        // instead of the sync API shown here, but this demonstrates the pool integration).
-        try {
-            std::future<std::string> result_future = worker_pool_.enqueue(ingest_task);
-            std::string msg = result_future.get();
+            // --- ACTUAL BUSINESS LOGIC ---
+            // 1. Spatial Routing (Section 4)
+            double lat = request_.query_location().latitude();
+            double lon = request_.query_location().longitude();
             
-            reply->set_success(true);
-            reply->set_message(msg);
-            return Status::OK;
-        } catch (const std::exception& e) {
-            reply->set_success(false);
-            reply->set_message(e.what());
-            return Status(grpc::StatusCode::INTERNAL, e.what());
+            std::vector<std::string> target_nodes = shard_manager_->routeSearch(
+                lat, lon, request_.max_radius_meters()
+            );
+
+            // 2. Vector Engine Retrieval (Section 5)
+            // Here is where the FlatHNSWIndex (flat_hnsw.cc) would be queried.
+            
+            // Constructing mock response
+            reply_.set_compute_time_ms(0.8f); 
+            
+            // Transition to FINISH and send the response back to the client.
+            status_ = FINISH;
+            responder_.Finish(reply_, Status::OK, this);
+        } else {
+            // status_ == FINISH
+            // The RPC is fully complete. We manage our own memory and delete ourselves.
+            GPR_ASSERT(status_ == FINISH);
+            delete this;
         }
     }
 
-    /**
-     * @brief RPC implementation for SearchProperties.
-     * This is where the Phase 2 GPU acceleration will be triggered.
-     */
-    Status SearchProperties(ServerContext* context, const SearchRequest* request, 
-                            SearchResponse* reply) override {
+private:
+    RealEstService::AsyncService* service_;
+    ServerCompletionQueue* cq_;
+    ServerContext ctx_;
+    
+    SearchRequest request_;
+    SearchResponse reply_;
+    ServerAsyncResponseWriter<SearchResponse> responder_;
+    ShardManager* shard_manager_;
+
+    // The state machine defining the lifecycle of the RPC
+    enum CallStatus { CREATE, PROCESS, FINISH };
+    CallStatus status_;
+};
+
+class AsyncServerImpl {
+public:
+    ~AsyncServerImpl() {
+        server_->Shutdown();
+        cq_->Shutdown();
+    }
+
+    void Run() {
+        std::string server_address("0.0.0.0:50051");
+        ServerBuilder builder;
         
-        // Start high-resolution timer for Phase 4 metrics tracking
-        auto start_time = std::chrono::high_resolution_clock::now();
-
-        auto search_task = [this, request, reply]() {
-            double lat = request->query_location().latitude();
-            double lon = request->query_location().longitude();
-            
-            // 1. Determine which nodes hold the relevant data
-            std::vector<std::string> target_nodes = shard_manager_.routeSearch(
-                lat, lon, request->max_radius_meters()
-            );
-
-            // 2. PHASE 2 INTEGRATION POINT: 
-            // This is where you will invoke your fused Triton/CUDA kernel.
-            // e.g., run_fused_geo_score_kernel(request->query_embedding().data(), ...);
-            
-            // Simulate the GPU compute time for demonstration purposes (e.g., 0.5ms)
-            std::this_thread::sleep_for(std::chrono::microseconds(500));
-
-            // Mocking a result returned by the GPU kernel
-            SearchResult* result = reply->add_results();
-            result->set_property_id("mock_property_883A");
-            result->set_fused_score(0.94f); // High combined geo+semantic score
-        };
-
-        // Execute the heavy search task in the worker pool
-        worker_pool_.enqueue(search_task).get();
-
-        // Calculate and attach the compute time metric
-        auto end_time = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<float, std::milli> duration = end_time - start_time;
+        builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+        builder.RegisterService(&service_);
         
-        reply->set_compute_time_ms(duration.count());
+        // This replaces the thread pool. The CompletionQueue is the heart of the async model.
+        cq_ = builder.AddCompletionQueue();
+        server_ = builder.BuildAndStart();
+        std::cout << "[Async Server] Listening on " << server_address << std::endl;
 
-        return Status::OK;
+        // Register dummy workers for the shard manager
+        shard_manager_.registerWorker("node-0.internal");
+        shard_manager_.registerWorker("node-1.internal");
+
+        HandleRpcs();
     }
 
 private:
-    WorkerPool worker_pool_;
+    void HandleRpcs() {
+        // Spawn the first CallData instance to start listening
+        new CallData(&service_, cq_.get(), &shard_manager_);
+        
+        void* tag;  // Uniquely identifies a request.
+        bool ok;
+        
+        // Block waiting to read the next event from the completion queue.
+        // In a true multi-core setup (Section 3), you would run this loop 
+        // on exactly one pinned thread per physical CPU core.
+        while (true) {
+            GPR_ASSERT(cq_->Next(&tag, &ok));
+            
+            // Ensure the event is valid (e.g., client didn't disconnect unexpectedly)
+            if (!ok) {
+                // In production, handle graceful cleanup here
+                continue; 
+            }
+            
+            // Cast the tag back to our CallData state machine and advance it
+            static_cast<CallData*>(tag)->Proceed();
+        }
+    }
+
+    std::unique_ptr<ServerCompletionQueue> cq_;
+    RealEstService::AsyncService service_;
+    std::unique_ptr<Server> server_;
     ShardManager shard_manager_;
 };
 
 } // namespace hpc
 } // namespace realest
 
-// ============================================================================
-// SERVER BOOTSTRAP
-// ============================================================================
-
-void RunServer() {
-    std::string server_address("0.0.0.0:50051");
-    realest::hpc::RealEstServiceImpl service;
-
-    ServerBuilder builder;
-    
-    // Listen on the given address without any authentication mechanism for now
-    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
-    
-    // Register "service" as the instance through which we'll communicate with clients
-    builder.RegisterService(&service);
-    
-    // Finally assemble the server
-    std::unique_ptr<Server> server(builder.BuildAndStart());
-    std::cout << "[Server] RealEst-HPC Inference Engine listening on " << server_address << std::endl;
-    std::cout << "[Server] Operating with " << std::thread::hardware_concurrency() 
-              << " hardware threads in the worker pool.\n";
-
-    // Wait for the server to shutdown. Note that some other thread must be
-    // responsible for shutting down the server for this call to ever return.
-    server->Wait();
-}
-
 int main(int argc, char** argv) {
-    // Enable gRPC reflection so tools like grpcurl or Postman can inspect the API
-    grpc::reflection::InitProtoReflectionServerBuilderPlugin();
-    
-    RunServer();
+    realest::hpc::AsyncServerImpl server;
+    server.Run();
     return 0;
 }
