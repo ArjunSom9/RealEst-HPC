@@ -3,38 +3,41 @@ import torch.fx
 from torch.fx import subgraph_rewriter
 import time
 
-# Import your Phase 2 custom kernel
 import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 try:
-    from acceleration.triton_kernels.fused_geo_score import run_fused_geo_score
+    from optimized_geo_scoring import run_fused_geo_attention
 except ImportError:
-    print("Warning: Could not import run_fused_geo_score. Ensure paths are correct.")
+    print("Warning: Could not import run_fused_geo_attention. Ensure paths are correct.")
     # Fallback mock for demonstration if the file isn't physically present
-    def run_fused_geo_score(*args, **kwargs):
+    def run_fused_geo_attention(*args, **kwargs):
         pass
 
 # ============================================================================
 # 1. DEFINE THE PATTERNS FOR GRAPH MATCHING
 # ============================================================================
 
-def inefficient_eager_pattern(q_vec, q_loc, d_vecs, d_locs, weight):
+def inefficient_eager_pattern(q, k, v):
     """
     The exact sequence of PyTorch operations we want the compiler to hunt for.
-    This represents the 'naive' implementation that wastes memory bandwidth.
+    This represents the naive O(N^2) distance attention that starves the GPU.
     """
-    sim_scores = torch.matmul(d_vecs, q_vec)
-    dist_sq = torch.sum((d_locs - q_loc)**2, dim=1)
-    fused = sim_scores - (dist_sq * weight)
-    return fused
+    qk = torch.matmul(q, k.t())
+    q_sq = torch.sum(q**2, dim=1, keepdim=True)
+    k_sq = torch.sum(k**2, dim=1, keepdim=True).t()
+    
+    dist_sq = (2.0 * qk) - q_sq - k_sq
+    attn = torch.softmax(dist_sq, dim=-1)
+    
+    return torch.matmul(attn.to(v.dtype), v)
 
-def optimized_fused_replacement(q_vec, q_loc, d_vecs, d_locs, weight):
+def optimized_fused_replacement(q, k, v):
     """
     The node we want to insert into the graph whenever we find the pattern above.
     This routes execution directly to your custom GPU kernel.
     """
-    return run_fused_geo_score(q_vec, q_loc, d_vecs, d_locs, weight)
+    return run_fused_geo_attention(q, k, v)
 
 
 # ============================================================================
@@ -82,41 +85,42 @@ def realest_hpc_backend(gm: torch.fx.GraphModule, example_inputs):
 # 3. DEMONSTRATION: AUTOMATIC OPTIMIZATION OF A DATA SCIENTIST'S MODEL
 # ============================================================================
 
-class DataScientistModel(torch.nn.Module):
+class TransformerPricingModel(torch.nn.Module):
     """
-    A hypothetical model written by a data scientist. 
-    They don't know anything about your custom CUDA/Triton kernels.
+    A hypothetical Transformer model written by a data scientist. 
+    They author standard PyTorch, completely unaware of the Triton kernels.
     """
-    def __init__(self, weight=0.1):
+    def __init__(self):
         super().__init__()
-        self.weight = weight
 
-    def forward(self, q_vec, q_loc, d_vecs, d_locs):
-        # The data scientist writes standard PyTorch
-        sim_scores = torch.matmul(d_vecs, q_vec)
-        dist_sq = torch.sum((d_locs - q_loc)**2, dim=1)
+    def forward(self, q, k, v):
+        # The data scientist writes standard spatial attention logic
+        qk = torch.matmul(q, k.t())
+        q_sq = torch.sum(q**2, dim=1, keepdim=True)
+        k_sq = torch.sum(k**2, dim=1, keepdim=True).t()
         
-        # Intermediate layers might exist here
+        dist_sq = (2.0 * qk) - q_sq - k_sq
+        attn = torch.softmax(dist_sq, dim=-1)
         
-        fused = sim_scores - (dist_sq * self.weight)
+        output = torch.matmul(attn.to(v.dtype), v)
         
-        # Apply an activation function (just to prove the graph contains more than just our pattern)
-        return torch.relu(fused)
+        # Apply a layer norm (proving the graph contains more than just our pattern)
+        return torch.nn.functional.layer_norm(output, output.shape[1:])
 
 if __name__ == "__main__":
     print("=== Phase 3: Compiler Optimization Pass Demonstration ===")
     
-    # 1. Setup mock data
-    dim = 128
-    num_docs = 1000
-    q_vec = torch.randn(dim, device='cuda')
-    q_loc = torch.randn(2, device='cuda')
-    d_vecs = torch.randn((num_docs, dim), device='cuda')
-    d_locs = torch.randn((num_docs, 2), device='cuda')
-    weight = torch.tensor(0.1, device='cuda')
+    # 1. Setup mock data (Queries, Keys, Values)
+    NUM_QUERIES = 128
+    NUM_DOCS = 1024
+    DIM = 64
+    
+    q = torch.randn((NUM_QUERIES, DIM), device='cuda', dtype=torch.float16)
+    k = torch.randn((NUM_DOCS, DIM), device='cuda', dtype=torch.float16)
+    v = torch.randn((NUM_DOCS, DIM), device='cuda', dtype=torch.float16)
 
     # 2. Instantiate the naive model
-    model = DataScientistModel()
+    model = TransformerPricingModel()
 
     # 3. Compile the model using OUR custom backend
     # This satisfies the requirement: "Use torch.compile to capture a PyTorch model"
@@ -125,7 +129,7 @@ if __name__ == "__main__":
 
     # 4. Execute the optimized model (triggers the compiler pass on the first run)
     print("\nExecuting Model...")
-    result = optimized_model(q_vec, q_loc, d_vecs, d_locs)
+    result = optimized_model(q, k, v)
     
     print("Execution complete. Result shape:", result.shape)
-    print("Phase 3 complete! We successfully optimized other people's code automatically.")
+    print("Phase 3 complete! We successfully optimized the Transformer logic automatically.")
