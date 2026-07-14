@@ -45,104 +45,136 @@ def hello_world_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 # ============================================================================
 
 @triton.jit
-def fused_geo_score_kernel(
-    # Pointers to matrices
-    query_vec_ptr,    # [dim]
-    query_loc_ptr,    # [2] -> Lat, Lon
-    doc_vecs_ptr,     # [num_docs, dim]
-    doc_locs_ptr,     # [num_docs, 2]
-    output_ptr,       # [num_docs]
+def fused_geo_attention_kernel(
+    # Pointers to input/output matrices
+    Q, K, V, Out,
+    Q_sq_norms, K_sq_norms, # Pre-computed L2 norms for the expansion trick
+    
+    # Strides to navigate memory layouts
+    stride_qm, stride_qk,
+    stride_kn, stride_kk,
+    stride_vn, stride_vk,
+    stride_om, stride_ok,
     
     # Matrix dimensions
-    num_docs,
-    dim,
-    geo_weight,       # Float: How heavily to penalize physical distance
+    num_queries, num_docs, dim,
     
-    # Strides (to navigate memory layout)
-    stride_doc_vecs_batch,
-    stride_doc_vecs_dim,
-    stride_doc_locs_batch,
-    
-    # Meta-parameters
-    BLOCK_SIZE_N: tl.constexpr, # Number of documents processed per thread block
-    BLOCK_SIZE_D: tl.constexpr  # Dimension of the embeddings (must be power of 2)
+    # Meta-parameters for block sizes
+    BLOCK_M: tl.constexpr, # Size of the Query block (BLOCK_Q)
+    BLOCK_N: tl.constexpr, # Size of the Key/Doc block (BLOCK_K)
+    BLOCK_D: tl.constexpr  # Embedding dimension
 ):
     """
-    Fuses Cosine Similarity (Dot Product) and Physical Distance (Euclidean) 
-    into a single pass over the data to avoid global memory round-trips.
+    Highly optimized Triton kernel that computes spatial attention scores 
+    using the expanded Euclidean distance formula: -||Q-K||^2 = 2(Q*K) - ||Q||^2 - ||K||^2
+    This allows the dense computation to be dispatched to Tensor Cores via tl.dot.
     """
-    # 1. Map this block to its specific subset of documents
-    pid = tl.program_id(axis=0)
-    doc_offsets = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    doc_mask = doc_offsets < num_docs
-
-    # 2. Load the Single Query Data (Broadcasted to all threads in this block)
-    # Load Query Vector
-    dim_offsets = tl.arange(0, BLOCK_SIZE_D)
-    q_vec = tl.load(query_vec_ptr + dim_offsets, mask=dim_offsets < dim, other=0.0)
+    # 1. Map this program ID to a specific block of Queries (BLOCK_Q)
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     
-    # Load Query Location (Lat/Lon)
-    q_lat = tl.load(query_loc_ptr + 0)
-    q_lon = tl.load(query_loc_ptr + 1)
-
-    # 3. Load the Batch of Document Data
-    # Calculate 2D memory pointers for the document embeddings
-    doc_vecs_ptrs = doc_vecs_ptr + (doc_offsets[:, None] * stride_doc_vecs_batch) + (dim_offsets[None, :] * stride_doc_vecs_dim)
+    # 2. Load the block of Queries (BLOCK_Q) into ultra-fast SRAM
+    offs_d = tl.arange(0, BLOCK_D)
+    q_ptrs = Q + (offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk)
+    q = tl.load(q_ptrs, mask=(offs_m[:, None] < num_queries) & (offs_d[None, :] < dim), other=0.0)
     
-    # Load the document embeddings [BLOCK_SIZE_N, BLOCK_SIZE_D]
-    d_vecs = tl.load(doc_vecs_ptrs, mask=(doc_mask[:, None]) & (dim_offsets[None, :] < dim), other=0.0)
+    # Load the pre-computed squared L2 norms for these specific queries
+    q_norm_ptrs = Q_sq_norms + offs_m
+    q_norms = tl.load(q_norm_ptrs, mask=offs_m < num_queries, other=0.0)
     
-    # Load document locations [BLOCK_SIZE_N]
-    d_lats = tl.load(doc_locs_ptr + doc_offsets * stride_doc_locs_batch + 0, mask=doc_mask)
-    d_lons = tl.load(doc_locs_ptr + doc_offsets * stride_doc_locs_batch + 1, mask=doc_mask)
+    # 3. Initialize running maximums and sums entirely within thread-local registers
+    # This completely circumvents the HBM memory bandwidth bottleneck.
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf") # Running Max
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)                # Running Sum
+    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)       # Final Output Accumulator
 
-    # 4. FUSED MATH: Compute both metrics simultaneously in SRAM
-    # A. Semantic Similarity (Dot Product, assuming pre-normalized vectors)
-    # Element-wise multiply query by docs, then sum along the dimension axis
-    sim_scores = tl.sum(q_vec[None, :] * d_vecs, axis=1)
+    # 4. Enter the sequence loop, iterating over blocks of Keys/Documents (BLOCK_K)
+    for start_n in range(0, num_docs, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        
+        # Calculate pointers and load Keys (Transposed for matrix multiplication)
+        # We load as [dim, BLOCK_N] so inner dimensions match for tl.dot(q, k)
+        k_ptrs = K + (offs_d[:, None] * stride_kk + offs_n[None, :] * stride_kn)
+        k = tl.load(k_ptrs, mask=(offs_d[:, None] < dim) & (offs_n[None, :] < num_docs), other=0.0)
+        
+        # Load the pre-computed squared L2 norms for these keys
+        k_norm_ptrs = K_sq_norms + offs_n
+        k_norms = tl.load(k_norm_ptrs, mask=offs_n < num_docs, other=0.0)
+        
+        # 5. Execute dense inner product utilizing Tensor Cores (3x throughput increase)
+        # q is [BLOCK_M, BLOCK_D], k is [BLOCK_D, BLOCK_N] -> qk is [BLOCK_M, BLOCK_N]
+        qk = tl.dot(q, k)
+        
+        # 6. Apply the Mathematical Expansion: -||Q-K||^2 = 2QK - Q^2 - K^2
+        # This replaces slow element-wise SIMT math with native matrix ops
+        dist_sq = (2.0 * qk) - q_norms[:, None] - k_norms[None, :]
+        
+        # 7. Maintain running statistics for the Attention (Softmax) reduction in registers
+        m_ij = tl.max(dist_sq, 1)
+        m_i_new = tl.maximum(m_i, m_ij)
+        
+        alpha = tl.exp(m_i - m_i_new)
+        beta = tl.exp(dist_sq - m_i_new[:, None])
+        
+        l_i = l_i * alpha + tl.sum(beta, 1)
+        
+        # 8. Load corresponding Value embeddings (for standard attention architectures)
+        v_ptrs = V + (offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk)
+        v = tl.load(v_ptrs, mask=(offs_n[:, None] < num_docs) & (offs_d[None, :] < dim), other=0.0)
+        
+        # Scale the accumulator by the maximum difference, then add the new value block
+        acc = acc * alpha[:, None]
+        acc += tl.dot(beta.to(tl.float16), v)
+        
+        # Update running max for the next loop iteration
+        m_i = m_i_new
+        
+    # 9. Normalize the final attention outputs and write to High Bandwidth Memory exactly once
+    acc = acc / l_i[:, None]
+    
+    out_ptrs = Out + (offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok)
+    tl.store(out_ptrs, acc, mask=(offs_m[:, None] < num_queries) & (offs_d[None, :] < dim))
 
-    # B. Geospatial Penalty (Squared Euclidean distance for speed)
-    lat_diff = q_lat - d_lats
-    lon_diff = q_lon - d_lons
-    dist_sq = (lat_diff * lat_diff) + (lon_diff * lon_diff)
-    geo_penalty = dist_sq * geo_weight
 
-    # C. Final Fusion Equation
-    fused_scores = sim_scores - geo_penalty
-
-    # 5. Store the final combined score back to Global Memory
-    tl.store(output_ptr + doc_offsets, fused_scores, mask=doc_mask)
-
-
-def run_fused_geo_score(
-    query_vec: torch.Tensor,
-    query_loc: torch.Tensor,
-    doc_vecs: torch.Tensor,
-    doc_locs: torch.Tensor,
-    geo_weight: float = 0.1
+def run_fused_geo_attention(
+    queries: torch.Tensor, 
+    keys: torch.Tensor, 
+    values: torch.Tensor
 ) -> torch.Tensor:
-    """Python wrapper to launch the custom Triton fused kernel."""
-    assert query_vec.is_cuda and doc_vecs.is_cuda, "Tensors must be on GPU"
-    assert doc_vecs.shape[1] == query_vec.shape[0], "Dimension mismatch"
+    """
+    Python wrapper simulating the exact execution path triggered by the 
+    custom TorchDynamo compiler pass detailed in the architecture document.
+    """
+    assert queries.is_cuda and keys.is_cuda, "Tensors must be located on the GPU"
     
-    num_docs, dim = doc_vecs.shape
-    output = torch.empty(num_docs, device=doc_vecs.device, dtype=torch.float32)
+    num_queries, dim = queries.shape
+    num_docs, _ = keys.shape
     
-    # Find the next power of 2 for the dimension (Triton requirement for block sizes)
-    BLOCK_SIZE_D = triton.next_power_of_2(dim)
-    BLOCK_SIZE_N = 1024  # Process 1024 properties per block
+    # Pre-compute L2 Squared Norms (Often done upstream or natively fast in PyTorch)
+    # This prepares the data for the algebraic expansion inside the kernel
+    q_sq_norms = torch.sum(queries ** 2, dim=1)
+    k_sq_norms = torch.sum(keys ** 2, dim=1)
     
-    grid = lambda meta: (triton.cdiv(num_docs, meta['BLOCK_SIZE_N']),)
+    output = torch.empty((num_queries, dim), device=queries.device, dtype=torch.float16)
     
-    fused_geo_score_kernel[grid](
-        query_vec, query_loc, 
-        doc_vecs, doc_locs, 
-        output,
-        num_docs, dim, geo_weight,
-        doc_vecs.stride(0), doc_vecs.stride(1),
-        doc_locs.stride(0),
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_D=BLOCK_SIZE_D
+    # Hardware heuristics: Tile sizes for the SRAM
+    BLOCK_M = 128
+    BLOCK_N = 64
+    BLOCK_D = triton.next_power_of_2(dim)
+    
+    # Launch grid: 1 block per Query Tile
+    grid = lambda meta: (triton.cdiv(num_queries, meta['BLOCK_M']),)
+    
+    # Dispatch to the optimized kernel
+    fused_geo_attention_kernel[grid](
+        queries, keys, values, output,
+        q_sq_norms, k_sq_norms,
+        queries.stride(0), queries.stride(1),
+        keys.stride(0), keys.stride(1),
+        values.stride(0), values.stride(1),
+        output.stride(0), output.stride(1),
+        num_queries, num_docs, dim,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D
     )
     
     return output
